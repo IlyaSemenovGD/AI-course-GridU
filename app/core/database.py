@@ -342,8 +342,8 @@ class DatabaseManager:
                     f"Keyword '{kw}' is not allowed in queries.", sql_text
                 )
 
-        # Append LIMIT if missing
-        final_sql = sql_text.rstrip(";")
+        # Strip trailing semicolons and whitespace (handles "...;\n", "; ", etc.)
+        final_sql = re.sub(r"[\s;]+$", "", sql_text.strip())
         if "LIMIT" not in upper:
             final_sql += f" LIMIT {max_rows}"
 
