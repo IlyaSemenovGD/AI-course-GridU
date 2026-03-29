@@ -105,6 +105,22 @@ def end_trace(trace, output: Any = None) -> None:
         pass
 
 
+def score_trace(trace, name: str, value: float, comment: str = "") -> None:
+    """
+    Attach a numeric score to *trace* (e.g. jailbreak probability).
+    Safe no-op when Langfuse is unavailable.
+    """
+    if isinstance(trace, _NullTrace):
+        return
+    lf = get_langfuse()
+    if lf is None:
+        return
+    try:
+        lf.score(trace_id=trace.id, name=name, value=value, comment=comment)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Null-object pattern (no-op stub)
 # ---------------------------------------------------------------------------

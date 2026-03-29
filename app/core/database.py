@@ -24,6 +24,16 @@ from psycopg2.extras import execute_values
 
 
 # ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class QueryExecutionError(Exception):
+    def __init__(self, message: str, sql: str = "") -> None:
+        super().__init__(message)
+        self.sql = sql
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -247,6 +257,105 @@ class DatabaseManager:
             cur.execute("DELETE FROM public._datasets WHERE id = %s;", (dataset_id,))
             conn.commit()
         return True
+
+    # ------------------------------------------------------------------
+    # Schema introspection for SQL agent
+    # ------------------------------------------------------------------
+
+    def get_schema_info(self, dataset_id: int) -> Optional[str]:
+        """
+        Return a human-readable DDL-like description of the dataset's tables.
+        Uses the stored DDL text if available; otherwise introspects live columns.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT schema_name, tables, ddl_text FROM public._datasets WHERE id = %s;",
+                (dataset_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            schema_name, table_names, ddl_text = row
+
+        if ddl_text and ddl_text.strip():
+            return ddl_text
+
+        # Fallback: introspect information_schema
+        lines = []
+        with self._connect() as conn, conn.cursor() as cur:
+            for tbl in table_names:
+                safe = _slugify(tbl)
+                cur.execute(
+                    """
+                    SELECT column_name, data_type, is_nullable
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                    ORDER BY ordinal_position;
+                    """,
+                    (schema_name, safe),
+                )
+                cols = cur.fetchall()
+                if not cols:
+                    continue
+                col_defs = ",\n    ".join(
+                    f"{c[0]} {c[1].upper()}{'' if c[2] == 'YES' else ' NOT NULL'}"
+                    for c in cols
+                )
+                lines.append(f"CREATE TABLE {tbl} (\n    {col_defs}\n);")
+
+        return "\n\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Query execution for SQL agent
+    # ------------------------------------------------------------------
+
+    def execute_query(
+        self,
+        schema_name: str,
+        sql_text: str,
+        max_rows: int = 500,
+    ) -> tuple[pd.DataFrame, str]:
+        """
+        Execute a read-only SELECT query within *schema_name*.
+
+        Returns (dataframe, final_sql_executed).
+        Raises QueryExecutionError on any failure.
+        """
+        import sqlparse  # local import to avoid top-level dep at module load
+
+        # Safety: only SELECT or WITH (CTE) allowed
+        parsed = sqlparse.parse(sql_text.strip())
+        if not parsed:
+            raise QueryExecutionError("Empty query.", sql_text)
+        stmt_type = parsed[0].get_type()
+        if stmt_type not in ("SELECT", "UNKNOWN", None):
+            raise QueryExecutionError(
+                f"Only SELECT queries are permitted (got {stmt_type}).",
+                sql_text,
+            )
+        # Block dangerous keywords regardless of parser classification
+        upper = sql_text.upper()
+        for kw in ("INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER",
+                   "TRUNCATE", "GRANT", "REVOKE", "EXECUTE", "CALL"):
+            if re.search(rf"\b{kw}\b", upper):
+                raise QueryExecutionError(
+                    f"Keyword '{kw}' is not allowed in queries.", sql_text
+                )
+
+        # Append LIMIT if missing
+        final_sql = sql_text.rstrip(";")
+        if "LIMIT" not in upper:
+            final_sql += f" LIMIT {max_rows}"
+
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f'SET search_path TO "{schema_name}", public;')
+                    cur.execute("SET TRANSACTION READ ONLY;")
+                df = pd.read_sql(final_sql, conn)
+            return df, final_sql + ";"
+        except Exception as exc:
+            raise QueryExecutionError(str(exc), final_sql) from exc
 
     # ------------------------------------------------------------------
     # Quick connectivity check
